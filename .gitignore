@@ -1,0 +1,5 @@
+.build/
+.swiftpm/
+Tidy.app/
+.DS_Store
+.claude/settings.local.json
