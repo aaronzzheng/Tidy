@@ -30,6 +30,9 @@ final class Janitor: ObservableObject {
 
     /// A file still being written has a moving size; leave it a moment.
     private static let settleSeconds: TimeInterval = 60
+    /// A screenshot is written once, whole. It only needs long enough for the
+    /// write to have finished, not the minute a download gets.
+    private static let screenshotSettleSeconds: TimeInterval = 3
 
     @Published var renameScreenshots = true { didSet { persist() } }
     @Published var sortDownloads = false { didSet { persist() } }
@@ -43,6 +46,16 @@ final class Janitor: ObservableObject {
         .urls(for: .downloadsDirectory, in: .userDomainMask)[0]
     var screenshotsFolder: URL = Janitor.screenshotFolder()
 
+    /// Screenshots that appeared while Tidy was running, with the app that was in
+    /// front at that moment. The rename rule works from this and nothing else:
+    /// a screenshot that was already on disk when Tidy started has no owner we
+    /// can know, and naming it after whatever happens to be in front now would
+    /// be wrong more often than right.
+    private var screenshotOwners: [URL: String] = [:]
+    /// Everything in the screenshots folder that looked like a screenshot the
+    /// last time we looked, so a folder event can tell new arrivals from old.
+    private var seenScreenshots: Set<URL> = []
+
     private var watchers: [DirectoryWatcher] = []
     private var pending: DispatchWorkItem?
     private let defaults = UserDefaults.standard
@@ -54,7 +67,8 @@ final class Janitor: ObservableObject {
             renameScreenshots = defaults.bool(forKey: "Tidy.renameScreenshots")
             sortDownloads = defaults.bool(forKey: "Tidy.sortDownloads")
             trashOldInstallers = defaults.bool(forKey: "Tidy.trashOldInstallers")
-            installerAgeDays = defaults.integer(forKey: "Tidy.installerAgeDays")
+            // A zero here would make "older than" mean "all of them".
+            installerAgeDays = max(1, defaults.integer(forKey: "Tidy.installerAgeDays"))
         }
         log = (defaults.array(forKey: "Tidy.log") as? [String] ?? []).map {
             Action(date: Date(), text: $0)
@@ -69,61 +83,114 @@ final class Janitor: ObservableObject {
     }
 
     func start() {
-        var folders = [downloadsFolder]
-        if screenshotsFolder != downloadsFolder { folders.append(screenshotsFolder) }
+        seenScreenshots = Set(contents(of: screenshotsFolder).filter(Self.looksLikeScreenshot))
 
-        watchers = folders.compactMap { folder in
-            DirectoryWatcher(folder) { [weak self] in self?.scheduleSweep() }
+        let watchesScreenshots = screenshotsFolder == downloadsFolder
+        if let downloads = DirectoryWatcher(downloadsFolder, onChange: { [weak self] in
+            if watchesScreenshots { self?.noteNewScreenshots() }
+            self?.scheduleSweep()
+        }) {
+            watchers.append(downloads)
+        }
+        if !watchesScreenshots,
+           let screenshots = DirectoryWatcher(screenshotsFolder, onChange: { [weak self] in
+               // Read the frontmost app *now*, while the screenshot is fresh, not
+               // when the file has settled and you have long since moved on.
+               self?.noteNewScreenshots()
+               self?.scheduleSweep()
+           }) {
+            watchers.append(screenshots)
         }
         sweep()
     }
 
     func stop() {
+        pending?.cancel()
+        pending = nil
         watchers.forEach { $0.stop() }
         watchers.removeAll()
     }
 
     /// A single download produces a burst of directory events; run once after.
-    private func scheduleSweep() {
+    private func scheduleSweep(after delay: TimeInterval = 1.5) {
         pending?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.sweep() }
         pending = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// Records who was in front for any screenshot that has just appeared.
+    private func noteNewScreenshots() {
+        let current = Set(contents(of: screenshotsFolder).filter(Self.looksLikeScreenshot))
+        let arrived = current.subtracting(seenScreenshots)
+        seenScreenshots = current
+        guard !arrived.isEmpty else { return }
+
+        let frontmost = NSWorkspace.shared.frontmostApplication?.localizedName
+        guard let frontmost, frontmost != "Tidy" else { return }
+        for url in arrived { screenshotOwners[url] = frontmost }
     }
 
     // MARK: Rules
 
+    /// Runs every enabled rule. Files too fresh to touch are left for a follow-up
+    /// sweep scheduled for the moment the earliest of them settles — without
+    /// that, a rule would only ever fire on the *next* thing to land in the
+    /// folder, a minute or more after the file it was meant for.
     func sweep() {
-        if renameScreenshots { renameScreenshotsNow() }
-        if sortDownloads { sortDownloadsNow() }
+        var nextDue: Date?
+        func note(_ due: Date?) {
+            guard let due else { return }
+            nextDue = nextDue.map { min($0, due) } ?? due
+        }
+        if renameScreenshots { note(renameScreenshotsNow()) }
+        if sortDownloads { note(sortDownloadsNow()) }
         if trashOldInstallers { trashOldInstallersNow() }
-    }
 
-    func renameScreenshotsNow() {
-        let folder = screenshotsFolder
-        let frontmost = NSWorkspace.shared.frontmostApplication?.localizedName
-        for url in contents(of: folder) where Self.looksLikeScreenshot(url) {
-            guard hasSettled(url) else { continue }
-            guard let app = frontmost, app != "Tidy" else { continue }
-
-            let stamp = Self.stampFormatter.string(from: Self.creationDate(url) ?? Date())
-            let base = "\(Self.sanitize(app)) — \(stamp)"
-            let destination = Self.uniqueURL(in: folder, base: base,
-                                             extension: url.pathExtension)
-            move(url, to: destination, verb: "Renamed")
+        if let nextDue {
+            scheduleSweep(after: max(0.5, nextDue.timeIntervalSinceNow + 0.5))
         }
     }
 
-    func sortDownloadsNow() {
-        let folderNames = Set(Self.categories.map(\.folder))
+    /// Returns when the earliest not-yet-settled screenshot will be ready, if any.
+    @discardableResult
+    func renameScreenshotsNow() -> Date? {
+        var earliest: Date?
+        for (url, app) in screenshotOwners {
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                screenshotOwners[url] = nil
+                continue
+            }
+            if let due = settleDate(url, after: Self.screenshotSettleSeconds) {
+                earliest = earliest.map { min($0, due) } ?? due
+                continue
+            }
+
+            let stamp = Self.stampFormatter.string(from: Self.creationDate(url) ?? Date())
+            let base = "\(Self.sanitize(app)) — \(stamp)"
+            let destination = Self.uniqueURL(in: url.deletingLastPathComponent(), base: base,
+                                             extension: url.pathExtension)
+            move(url, to: destination, verb: "Renamed")
+            screenshotOwners[url] = nil
+            seenScreenshots.remove(url)
+        }
+        return earliest
+    }
+
+    /// Returns when the earliest not-yet-settled download will be ready, if any.
+    @discardableResult
+    func sortDownloadsNow() -> Date? {
+        var earliest: Date?
         for url in contents(of: downloadsFolder) {
-            guard !isDirectory(url), hasSettled(url) else { continue }
+            guard !isDirectory(url) else { continue }
             let ext = url.pathExtension.lowercased()
             guard !Self.inProgressExtensions.contains(ext) else { continue }
             guard let category = Self.categories.first(where: { $0.extensions.contains(ext) })
             else { continue }   // unknown kinds are left where they are, on purpose
-            guard !folderNames.contains(url.deletingLastPathComponent().lastPathComponent)
-            else { continue }
+            if let due = settleDate(url, after: Self.settleSeconds) {
+                earliest = earliest.map { min($0, due) } ?? due
+                continue
+            }
 
             let target = downloadsFolder.appendingPathComponent(category.folder,
                                                                isDirectory: true)
@@ -134,6 +201,7 @@ final class Janitor: ObservableObject {
                                              extension: url.pathExtension)
             move(url, to: destination, verb: "Filed into \(category.folder):")
         }
+        return earliest
     }
 
     func trashOldInstallersNow() {
@@ -175,9 +243,13 @@ final class Janitor: ObservableObject {
         (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
     }
 
-    private func hasSettled(_ url: URL) -> Bool {
-        guard let modified = Self.modifiedDate(url) else { return false }
-        return Date().timeIntervalSince(modified) > Self.settleSeconds
+    /// Nil once the file has been left alone long enough to touch; otherwise the
+    /// moment it will have been. A file whose dates cannot be read is never
+    /// settled — better to skip it than to move something half-written.
+    private func settleDate(_ url: URL, after settle: TimeInterval) -> Date? {
+        guard let modified = Self.modifiedDate(url) else { return .distantFuture }
+        let due = modified.addingTimeInterval(settle)
+        return due <= Date() ? nil : due
     }
 
     private func record(_ text: String) {
@@ -201,6 +273,7 @@ final class Janitor: ObservableObject {
             return FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
         }
         return URL(fileURLWithPath: (location as NSString).expandingTildeInPath)
+            .standardizedFileURL
     }
 
     /// `kMDItemIsScreenCapture` is not reliably set, so go by the name macOS

@@ -40,7 +40,7 @@ things it did, so you can see what happened rather than trusting it.
 - **Part-finished downloads** — `.download`, `.crdownload`, `.part`, `.opdownload`,
   `.tmp` — are skipped, because moving one mid-flight corrupts it.
 - **Anything modified in the last minute**, so a file still being written is left to
-  finish.
+  finish. Screenshots, which are written whole in one go, wait three seconds instead.
 - Folders. Only files are sorted.
 
 Name collisions never overwrite: a second `Safari — ….png` becomes `Safari — … 2.png`.
@@ -74,11 +74,21 @@ test and is not reliably set, so it is not used.
 - **`PopoverView.swift`** — the SwiftUI popover.
 
 `DirectoryWatcher` is a `DispatchSource` on a directory file descriptor. One download
-produces a burst of events, so sweeps are debounced by 1.5 seconds.
+produces a burst of events, so sweeps are debounced by 1.5 seconds. A sweep that finds
+files too fresh to touch schedules itself again for the moment the earliest of them
+settles, so a rule fires for the file that triggered it rather than for the next one to
+land in the folder.
+
+The screenshot rule reads the frontmost app the moment the file appears and remembers it
+against that file; the rename itself happens a few seconds later, once the write is
+surely finished.
 
 ## Known limits
 
-- The frontmost app is read when Tidy *notices* the screenshot, not when you took it.
-  Switch apps within that second and the name will be wrong.
+- The frontmost app is read when the screenshot file appears — a few seconds after you
+  press the shortcut, once the floating thumbnail is gone. Switch apps in that window and
+  the name will be wrong.
+- Screenshots already on disk when Tidy starts are left alone, and so is anything that
+  lands while it is not running: there is no way to know afterwards what they were of.
 - Categories are by file extension, not by UTI, so an extensionless file is ignored.
 - There is no undo beyond moving the file back yourself; the log says where it went.
