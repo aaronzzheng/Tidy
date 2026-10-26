@@ -14,7 +14,8 @@ Requires macOS 14+ and Swift 5.9+.
 ```
 
 The bundle is ad-hoc signed (`codesign --sign -`). No developer account, provisioning
-profile, or notarization is involved. Tidy needs no permissions.
+profile, or notarization is involved. The signature is pinned to the bundle ID, so the
+Downloads and Desktop folder access macOS asks for on first run survives rebuilds.
 
 ## The rules
 
@@ -22,7 +23,7 @@ profile, or notarization is involved. Tidy needs no permissions.
 |---|---|---|
 | Rename screenshots | on | `Screenshot 2026-08-27 at 8.42.11 PM.png` becomes `Safari — 2026-08-27 20.42.11.png`, using whichever app was in front |
 | Sort Downloads | **off** | Moves files into `Images`, `Documents`, `Archives`, `Installers`, `Media` beside them |
-| Trash old installers | **off** | Moves `.dmg` and `.pkg` older than your cutoff to the Trash |
+| Trash old installers | **off** | Moves `.dmg` and `.pkg` that have sat in Downloads longer than your cutoff to the Trash |
 
 The two rules that move things are off until you turn them on. A tool that
 rearranges your files without being asked is worse than no tool.
@@ -39,8 +40,9 @@ things it did, so you can see what happened rather than trusting it.
   catch-all bucket just relocates the mess.
 - **Part-finished downloads** — `.download`, `.crdownload`, `.part`, `.opdownload`,
   `.tmp` — are skipped, because moving one mid-flight corrupts it.
-- **Anything modified in the last minute**, so a file still being written is left to
-  finish. Screenshots, which are written whole in one go, wait three seconds instead.
+- **Anything that arrived or was modified in the last minute**, so a file still being
+  written or copied in is left to finish. Screenshots, which are written whole in one
+  go, wait three seconds instead.
 - Folders. Only files are sorted.
 
 Name collisions never overwrite: a second `Safari — ….png` becomes `Safari — … 2.png`.
@@ -49,6 +51,7 @@ Name collisions never overwrite: a second `Safari — ….png` becomes `Safari �
 
 Tidy renames screenshots wherever macOS is currently saving them, read from
 `com.apple.screencapture`'s `location` — the Desktop if you have never changed it.
+Change it in ⌘⇧5 and Tidy follows within half a minute.
 
 If your screenshots go to the **clipboard** rather than to a file, this rule will
 almost never fire, because there is no file to rename. Check with:

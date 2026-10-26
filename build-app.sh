@@ -33,11 +33,14 @@ cp "$BIN" "$APP/Contents/MacOS/Tidy"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
-# Ad-hoc signature. Enough for the audio-capture permission prompt to appear;
-# no developer account involved. Note the identity is the binary hash, so macOS
-# treats each rebuild as a new app and re-asks for permission.
-codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1 \
-  || codesign --force --sign - "$APP"
+# Ad-hoc signature; no developer account involved. By default an ad-hoc
+# identity is the binary hash, so every rebuild looks like a new app and the
+# Downloads and Desktop folder grants silently stop applying and macOS asks
+# again. Pinning the designated requirement to the bundle ID keeps the grant
+# valid across rebuilds.
+REQ='designated => identifier "com.tidy.Tidy"'
+codesign --force --sign - --timestamp=none -r="$REQ" "$APP" >/dev/null 2>&1 \
+  || codesign --force --sign - -r="$REQ" "$APP"
 
 echo "built $(pwd)/$APP"
 

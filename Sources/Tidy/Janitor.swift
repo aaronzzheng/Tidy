@@ -58,6 +58,12 @@ final class Janitor: ObservableObject {
 
     private var watchers: [DirectoryWatcher] = []
     private var pending: DispatchWorkItem?
+    /// Rechecks where screenshots are saved; there is no notification when the
+    /// ⌘⇧5 "Save to" choice changes.
+    private var locationTimer: Timer?
+    /// Files that already failed to move, so a file that cannot be moved is
+    /// reported once rather than on every sweep, crowding out the rest of the log.
+    private var failedMoves: Set<URL> = []
     private let defaults = UserDefaults.standard
 
     // MARK: Lifecycle
@@ -102,13 +108,36 @@ final class Janitor: ObservableObject {
             watchers.append(screenshots)
         }
         sweep()
+
+        if locationTimer == nil {
+            locationTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) {
+                [weak self] _ in self?.followScreenshotLocation()
+            }
+        }
     }
 
     func stop() {
         pending?.cancel()
         pending = nil
+        locationTimer?.invalidate()
+        locationTimer = nil
+        stopWatching()
+    }
+
+    private func stopWatching() {
         watchers.forEach { $0.stop() }
         watchers.removeAll()
+    }
+
+    /// Re-points the watchers when the screenshot location has changed since we
+    /// started, instead of watching the old folder until the next launch.
+    private func followScreenshotLocation() {
+        let current = Self.screenshotFolder()
+        guard current != screenshotsFolder else { return }
+        screenshotsFolder = current
+        pending?.cancel()
+        stopWatching()
+        start()
     }
 
     /// A single download produces a burst of directory events; run once after.
@@ -210,7 +239,10 @@ final class Janitor: ObservableObject {
         for folder in [downloadsFolder, installers] {
             for url in contents(of: folder) {
                 guard ["dmg", "pkg"].contains(url.pathExtension.lowercased()) else { continue }
-                guard let modified = Self.modifiedDate(url), modified < cutoff else { continue }
+                // When it arrived here, not when it was last written: a copied or
+                // AirDropped installer keeps its original date, and a two-year-old
+                // .dmg dragged in off a USB stick is not two years old to you.
+                guard let arrived = Self.arrivalDate(url), arrived < cutoff else { continue }
                 var trashed: NSURL?
                 // Trash, never delete: a wrong guess costs a drag back out.
                 try? FileManager.default.trashItem(at: url, resultingItemURL: &trashed)
@@ -226,8 +258,10 @@ final class Janitor: ObservableObject {
     private func move(_ url: URL, to destination: URL, verb: String) {
         do {
             try FileManager.default.moveItem(at: url, to: destination)
+            failedMoves.remove(url)
             record("\(verb) \(url.lastPathComponent) → \(destination.lastPathComponent)")
         } catch {
+            guard failedMoves.insert(url).inserted else { return }
             record("Couldn't move \(url.lastPathComponent): \(error.localizedDescription)")
         }
     }
@@ -235,7 +269,8 @@ final class Janitor: ObservableObject {
     private func contents(of folder: URL) -> [URL] {
         (try? FileManager.default.contentsOfDirectory(
             at: folder,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+            includingPropertiesForKeys: [.contentModificationDateKey, .addedToDirectoryDateKey,
+                                         .isDirectoryKey],
             options: [.skipsHiddenFiles])) ?? []
     }
 
@@ -247,8 +282,8 @@ final class Janitor: ObservableObject {
     /// moment it will have been. A file whose dates cannot be read is never
     /// settled — better to skip it than to move something half-written.
     private func settleDate(_ url: URL, after settle: TimeInterval) -> Date? {
-        guard let modified = Self.modifiedDate(url) else { return .distantFuture }
-        let due = modified.addingTimeInterval(settle)
+        guard let arrived = Self.arrivalDate(url) else { return .distantFuture }
+        let due = arrived.addingTimeInterval(settle)
         return due <= Date() ? nil : due
     }
 
@@ -301,8 +336,15 @@ final class Janitor: ObservableObject {
         return candidate
     }
 
-    static func modifiedDate(_ url: URL) -> Date? {
-        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+    /// The later of when the file was last written and when it was put in this
+    /// folder. Copies keep the source's modification date, so that alone would
+    /// make a file still arriving look long settled.
+    static func arrivalDate(_ url: URL) -> Date? {
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey,
+                                                       .addedToDirectoryDateKey])
+        let dates = [values?.contentModificationDate, values?.addedToDirectoryDate]
+            .compactMap { $0 }
+        return dates.max()
     }
 
     static func creationDate(_ url: URL) -> Date? {
@@ -311,6 +353,8 @@ final class Janitor: ObservableObject {
 
     static let stampFormatter: DateFormatter = {
         let formatter = DateFormatter()
+        // Fixed format: without POSIX, a 12-hour preference can rewrite HH.
+        formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
         return formatter
     }()
